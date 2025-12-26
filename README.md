@@ -140,7 +140,7 @@ uv run python gmail_to_s3.py --s3-bucket my-gmail-archive-bucket --dry-run --siz
 # Actually archive (default: emails with 10MB+ attachments, older than 1 year)
 uv run python gmail_to_s3.py --s3-bucket my-gmail-archive-bucket
 
-# Archive and remove from Gmail inbox
+# Archive emails in Gmail (removes from inbox, keeps in All Mail)
 uv run python gmail_to_s3.py --s3-bucket my-gmail-archive-bucket --archive-gmail
 
 # Process only emails with very large attachments (50MB+)
@@ -154,6 +154,37 @@ uv run python gmail_to_s3.py --s3-bucket my-gmail-archive-bucket --dry-run --log
 ```
 
 **Note**: The `--size-mb` parameter filters based on the total size of attachments in each email, not the entire email size.
+
+### ⚠️ DANGEROUS: Deleting Emails
+
+**WARNING: This is a permanent deletion. Only use if you fully understand the risks.**
+
+The script can automatically delete emails from Gmail after successful S3 upload, but this requires explicit confirmation:
+
+```bash
+# Test deletion in dry-run mode first (ALWAYS DO THIS FIRST)
+uv run python gmail_to_s3.py \
+  --s3-bucket my-gmail-archive-bucket \
+  --delete-gmail \
+  --i-understand-deletion-is-permanent \
+  --dry-run \
+  --max-emails 5
+
+# Actually delete emails (DANGEROUS - be very careful)
+uv run python gmail_to_s3.py \
+  --s3-bucket my-gmail-archive-bucket \
+  --delete-gmail \
+  --i-understand-deletion-is-permanent
+```
+
+**Important Notes on Deletion:**
+- Deleted emails are moved to Gmail's Trash folder
+- Emails in Trash are permanently deleted after 30 days
+- You can empty Trash manually to delete immediately
+- The script verifies S3 upload succeeded before deleting
+- **Always test with `--dry-run` and `--max-emails 5` first**
+- Cannot use both `--archive-gmail` and `--delete-gmail` together
+- Requires the `--i-understand-deletion-is-permanent` flag as a safety measure
 
 ### Search Archive
 

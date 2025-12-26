@@ -250,6 +250,38 @@ def archive_email(service, msg_id, dry_run=False):
         body={'removeLabelIds': ['INBOX']}
     ).execute()
 
+def delete_email(service, msg_id, dry_run=False):
+    """Permanently delete email from Gmail
+    
+    WARNING: This is a permanent deletion. The email will be moved to trash
+    and will be permanently deleted after 30 days (or immediately if trash is emptied).
+    """
+    if dry_run:
+        logger.warning("  [DRY RUN] Would PERMANENTLY DELETE email from Gmail")
+        return
+    
+    logger.warning("  ⚠ PERMANENTLY DELETING email from Gmail")
+    service.users().messages().trash(
+        userId='me',
+        id=msg_id
+    ).execute()
+
+def verify_s3_upload(s3_client, s3_bucket, s3_paths, dry_run=False):
+    """Verify that all files were successfully uploaded to S3"""
+    if dry_run:
+        logger.debug("  [DRY RUN] Would verify S3 upload")
+        return True
+    
+    try:
+        for path in s3_paths:
+            # Check if object exists in S3
+            s3_client.head_object(Bucket=s3_bucket, Key=path)
+        logger.debug("  ✓ Verified all %d files exist in S3", len(s3_paths))
+        return True
+    except Exception as e:
+        logger.error("  ✗ S3 verification failed: %s", e)
+        return False
+
 def upload_index_to_s3(s3_client, s3_bucket, dry_run=False):
     """Upload the index file to S3 for backup"""
     if not os.path.exists(INDEX_FILE):
@@ -298,7 +330,17 @@ def main():
     parser.add_argument(
         '--archive-gmail',
         action='store_true',
-        help='Archive emails in Gmail after uploading to S3'
+        help='Archive emails in Gmail after uploading to S3 (removes from inbox but keeps in All Mail)'
+    )
+    parser.add_argument(
+        '--delete-gmail',
+        action='store_true',
+        help='DANGEROUS: Permanently delete emails from Gmail after uploading to S3 (moves to trash)'
+    )
+    parser.add_argument(
+        '--i-understand-deletion-is-permanent',
+        action='store_true',
+        help='Required confirmation flag when using --delete-gmail'
     )
     parser.add_argument(
         '--max-emails',
@@ -315,6 +357,27 @@ def main():
     
     args = parser.parse_args()
     
+    # Safety check for deletion
+    if args.delete_gmail and not args.i_understand_deletion_is_permanent:
+        logger.error("=" * 60)
+        logger.error("SAFETY CHECK FAILED")
+        logger.error("=" * 60)
+        logger.error("You are attempting to DELETE emails from Gmail.")
+        logger.error("This is a PERMANENT action that cannot be undone.")
+        logger.error("")
+        logger.error("If you understand the risks and want to proceed, add:")
+        logger.error("  --i-understand-deletion-is-permanent")
+        logger.error("")
+        logger.error("NOTE: Deleted emails go to trash and are permanently")
+        logger.error("deleted after 30 days (or sooner if you empty trash).")
+        logger.error("=" * 60)
+        return
+    
+    if args.delete_gmail and args.archive_gmail:
+        logger.error("Cannot use both --archive-gmail and --delete-gmail together.")
+        logger.error("Choose one: archive (keeps in All Mail) or delete (moves to trash).")
+        return
+    
     # Set log level
     logger.setLevel(getattr(logging, args.log_level))
     
@@ -322,6 +385,12 @@ def main():
         logger.info("=" * 60)
         logger.info("RUNNING IN DRY-RUN MODE - No changes will be made")
         logger.info("=" * 60)
+    
+    if args.delete_gmail:
+        logger.warning("=" * 60)
+        logger.warning("⚠ DELETION MODE ENABLED ⚠")
+        logger.warning("Emails will be PERMANENTLY DELETED after upload")
+        logger.warning("=" * 60)
     
     logger.info("S3 Bucket: %s", args.s3_bucket)
     
@@ -398,8 +467,19 @@ def main():
             # Add to index
             add_to_index(msg_id, metadata, s3_paths, dry_run=args.dry_run)
             
-            # Optional: Archive the email from Gmail
-            if args.archive_gmail:
+            # Verify S3 upload before any Gmail modifications
+            if not args.dry_run:
+                upload_verified = verify_s3_upload(s3_client, args.s3_bucket, s3_paths, dry_run=args.dry_run)
+                if not upload_verified:
+                    logger.error("  ✗ Skipping Gmail operations - S3 upload verification failed")
+                    continue
+            
+            # Optional: Delete or archive the email from Gmail
+            if args.delete_gmail:
+                delete_email(gmail_service, msg_id, dry_run=args.dry_run)
+                if not args.dry_run:
+                    logger.info("  ✓ Deleted from Gmail")
+            elif args.archive_gmail:
                 archive_email(gmail_service, msg_id, dry_run=args.dry_run)
                 if not args.dry_run:
                     logger.info("  ✓ Archived in Gmail")

@@ -26,7 +26,7 @@ The script uses intelligent multi-stage processing with state tracking:
    - If `uploaded=true`: Verify S3 objects exist with correct size; skip upload if verified
    - If `archived=true` and `--archive-gmail` specified: Skip archiving
    - If all required actions already done: Skip email completely
-4. **Attachment Size Check**: For new emails, calculates total size of all attachments
+4. **Size Check**: Verifies total email size (body + attachments) meets the threshold
 5. **Selective Actions**: Only performs actions that haven't been completed yet
 6. **Index Update**: Updates index with current state flags
 
@@ -162,16 +162,16 @@ Save the three artifacts:
 # Dry run first (recommended)
 uv run python gmail_to_s3.py --s3-bucket my-gmail-archive-bucket --dry-run
 
-# Dry run with custom filters (emails with 20MB+ in attachments, older than 2 years)
+# Dry run with custom filters (emails larger than 20MB total, older than 2 years)
 uv run python gmail_to_s3.py --s3-bucket my-gmail-archive-bucket --dry-run --size-mb 20 --older-than-years 2
 
-# Actually archive (default: emails with 10MB+ attachments, older than 1 year)
+# Actually archive (default: emails larger than 10MB total, older than 1 year)
 uv run python gmail_to_s3.py --s3-bucket my-gmail-archive-bucket
 
 # Archive emails in Gmail (removes from inbox, keeps in All Mail)
 uv run python gmail_to_s3.py --s3-bucket my-gmail-archive-bucket --archive-gmail
 
-# Process only emails with very large attachments (50MB+)
+# Process only very large emails (50MB+ total size)
 uv run python gmail_to_s3.py --s3-bucket my-gmail-archive-bucket --size-mb 50 --older-than-years 3
 
 # Test with limited number of emails
@@ -184,9 +184,7 @@ uv run python gmail_to_s3.py --s3-bucket my-gmail-archive-bucket --dry-run --log
 uv run python gmail_to_s3.py --s3-bucket my-gmail-archive-bucket --force-reprocess
 ```
 
-**Note**: The `--size-mb` parameter filters based on the total size of attachments in each email, not the entire email size.
-
-**Deduplication**: The script automatically skips emails already present in `email_index.jsonl`. If you want to reprocess emails (e.g., after changing S3 bucket), use `--force-reprocess` flag.
+**Note**: The `--size-mb` parameter filters based on the total email size (body + attachments combined).
 
 ### ⚠️ DANGEROUS: Deleting Emails
 
@@ -218,6 +216,7 @@ uv run python gmail_to_s3.py \
 - **Always test with `--dry-run` and `--max-emails 5` first**
 - Cannot use both `--archive-gmail` and `--delete-gmail` together
 - Requires the `--i-understand-deletion-is-permanent` flag as a safety measure
+- Works on all emails meeting the size threshold (e.g., `--size-mb 1` with `--delete-gmail` will delete all emails >1MB after backup)
 
 ### Search Archive
 

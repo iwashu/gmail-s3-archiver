@@ -385,7 +385,7 @@ def main():
         '--size-mb',
         type=int,
         default=10,
-        help='Minimum email size in MB (default: 10)'
+        help='Minimum total email size in MB (default: 10)'
     )
     parser.add_argument(
         '--older-than-years',
@@ -587,10 +587,10 @@ def main():
             attachments_size_mb = calculate_attachments_size(attachments)
             logger.info("  Attachments: %d (total size: %.2f MB)", len(attachments), attachments_size_mb)
             
-            # Check if attachment size meets threshold
-            if attachments_size_mb < args.size_mb:
-                logger.info("  ⊘ Skipping: attachment size (%.2f MB) below threshold (%d MB)", 
-                           attachments_size_mb, args.size_mb)
+            # Check if total email size meets threshold
+            if metadata['size_mb'] < args.size_mb:
+                logger.info("  ⊘ Skipping: total email size (%.2f MB) below threshold (%d MB)", 
+                           metadata['size_mb'], args.size_mb)
                 skipped_count += 1
                 continue
             

@@ -44,7 +44,11 @@ def get_gmail_service():
     return build('gmail', 'v1', credentials=creds)
 
 def search_large_emails(service, size_mb=10, older_than_years=1):
-    """Search for emails larger than size_mb and older than specified years"""
+    """Search for emails larger than size_mb and older than specified years
+    
+    Note: This searches for emails where the TOTAL email size (including attachments)
+    is larger than size_mb. We'll filter further based on attachment sizes later.
+    """
     query = f'size:{size_mb}m older_than:{older_than_years}y'
     results = service.users().messages().list(userId='me', q=query).execute()
     messages = results.get('messages', [])
@@ -56,6 +60,11 @@ def search_large_emails(service, size_mb=10, older_than_years=1):
         messages.extend(results.get('messages', []))
     
     return messages
+
+def calculate_attachments_size(attachments):
+    """Calculate total size of attachments in MB"""
+    total_bytes = sum(att['size'] for att in attachments)
+    return total_bytes / (1024 * 1024)
 
 def get_email_data(service, msg_id):
     """Fetch full email data"""
@@ -313,6 +322,7 @@ def main():
     # Process each email
     total_size_mb = 0
     total_attachments = 0
+    skipped_count = 0
     
     for i, msg in enumerate(messages):
         try:
@@ -324,7 +334,6 @@ def main():
             
             # Parse metadata
             metadata = parse_email_metadata(email_data)
-            total_size_mb += metadata['size_mb']
             
             subject_truncated = metadata['subject'][:60]
             if len(metadata['subject']) > 60:
@@ -333,15 +342,25 @@ def main():
             logger.info("  Subject: %s", subject_truncated)
             logger.info("  From: %s", metadata['from'])
             logger.info("  Date: %s", metadata['date'])
-            logger.info("  Size: %.2f MB", metadata['size_mb'])
+            logger.info("  Total email size: %.2f MB", metadata['size_mb'])
             
             # Extract attachments
             parts = email_data.get('payload', {}).get('parts', [])
             attachments = extract_attachments(gmail_service, msg_id, parts, dry_run=args.dry_run)
-            total_attachments += len(attachments)
             
-            if attachments:
-                logger.info("  Attachments: %d", len(attachments))
+            # Calculate total attachment size
+            attachments_size_mb = calculate_attachments_size(attachments)
+            logger.info("  Attachments: %d (total size: %.2f MB)", len(attachments), attachments_size_mb)
+            
+            # Check if attachment size meets threshold
+            if attachments_size_mb < args.size_mb:
+                logger.info("  ⊘ Skipping: attachment size (%.2f MB) below threshold (%d MB)", 
+                           attachments_size_mb, args.size_mb)
+                skipped_count += 1
+                continue
+            
+            total_size_mb += metadata['size_mb']
+            total_attachments += len(attachments)
             
             # Upload to S3
             s3_paths = upload_to_s3(s3_client, email_data, msg_id, attachments, dry_run=args.dry_run)
@@ -371,7 +390,9 @@ def main():
     logger.info("=" * 60)
     logger.info("SUMMARY")
     logger.info("=" * 60)
-    logger.info("Total emails processed: %d", len(messages))
+    logger.info("Total emails found: %d", len(messages))
+    logger.info("Total emails archived: %d", len(messages) - skipped_count)
+    logger.info("Total emails skipped: %d", skipped_count)
     logger.info("Total attachments: %d", total_attachments)
     logger.info("Total size: %.2f MB (%.2f GB)", total_size_mb, total_size_mb/1024)
     

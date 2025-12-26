@@ -1,0 +1,31 @@
+# Sensitive files - DO NOT COMMIT
+credentials.json
+token.pickle
+
+# Index files (optional - you might want to backup these)
+email_index.jsonl
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# uv
+.uv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

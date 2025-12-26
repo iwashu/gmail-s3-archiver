@@ -14,13 +14,41 @@ Archive large Gmail emails with attachments to AWS S3 Glacier Deep Archive with 
 
 ## How It Works
 
-The script uses a two-step filtering process:
+The script uses intelligent multi-stage processing with state tracking:
 
 1. **Initial Gmail Search**: Searches for emails with total size > threshold (default 10MB) that are older than specified years
-2. **Attachment Size Check**: For each email found, calculates the total size of all attachments combined
-3. **Archive Decision**: Only archives emails where attachment total meets or exceeds the threshold
+2. **State Check**: Loads the local index (`email_index.jsonl`) to check what's already been done for each email:
+   - `uploaded`: Email and attachments uploaded to S3
+   - `archived`: Email archived in Gmail (removed from inbox)
+   - `deleted`: Email deleted from Gmail (moved to trash)
+3. **Smart Skip Logic**:
+   - If `deleted=true`: Skip entirely (email no longer in Gmail)
+   - If `uploaded=true`: Verify S3 objects exist with correct size; skip upload if verified
+   - If `archived=true` and `--archive-gmail` specified: Skip archiving
+   - If all required actions already done: Skip email completely
+4. **Attachment Size Check**: For new emails, calculates total size of all attachments
+5. **Selective Actions**: Only performs actions that haven't been completed yet
+6. **Index Update**: Updates index with current state flags
 
-**Example**: An email with 5 attachments of 3MB each (15MB total) will be archived, even if the email body is small. This helps you identify and backup emails that are consuming space primarily due to attachments.
+**Example Workflow**:
+```bash
+# Day 1: Upload to S3 only
+uv run python gmail_to_s3.py --s3-bucket my-bucket
+# Index: uploaded=true, archived=false, deleted=false
+
+# Day 2: Decide to also archive in Gmail
+uv run python gmail_to_s3.py --s3-bucket my-bucket --archive-gmail
+# Skips upload (already done), only archives in Gmail
+# Index: uploaded=true, archived=true, deleted=false
+
+# Day 3: Run again (no flags)
+uv run python gmail_to_s3.py --s3-bucket my-bucket
+# Skips everything - already fully processed
+```
+
+**S3 Verification**: If an email shows `uploaded=true` but S3 objects are missing or size-mismatched, the script automatically re-uploads.
+
+**Deduplication**: Multiple runs are safe and efficient - only missing actions are performed.
 
 ## Setup
 
@@ -151,9 +179,14 @@ uv run python gmail_to_s3.py --s3-bucket my-gmail-archive-bucket --max-emails 5 
 
 # Enable debug logging to see more details
 uv run python gmail_to_s3.py --s3-bucket my-gmail-archive-bucket --dry-run --log-level DEBUG
+
+# Force reprocess emails already in index (not recommended)
+uv run python gmail_to_s3.py --s3-bucket my-gmail-archive-bucket --force-reprocess
 ```
 
 **Note**: The `--size-mb` parameter filters based on the total size of attachments in each email, not the entire email size.
+
+**Deduplication**: The script automatically skips emails already present in `email_index.jsonl`. If you want to reprocess emails (e.g., after changing S3 bucket), use `--force-reprocess` flag.
 
 ### ⚠️ DANGEROUS: Deleting Emails
 
@@ -237,14 +270,23 @@ The index is stored as JSONL (one JSON object per line) for efficient searching:
   "to": "team@company.com",
   "date": "2023-06-15T09:00:00",
   "size_mb": 45.2,
+  "size_bytes": 47400960,
   "labels": ["INBOX", "IMPORTANT"],
   "s3_paths": [
     "emails/2023/06/abc123/email.json",
     "emails/2023/06/abc123/attachments/report.pdf"
   ],
-  "attachment_count": 1
+  "attachment_count": 1,
+  "uploaded": true,
+  "archived": false,
+  "deleted": false
 }
 ```
+
+**State Flags**:
+- `uploaded`: Email and attachments successfully uploaded to S3
+- `archived`: Email archived in Gmail (removed from inbox, kept in All Mail)
+- `deleted`: Email deleted from Gmail (moved to trash)
 
 ## Costs
 
@@ -304,6 +346,8 @@ crontab -e
 4. **Monitor costs** - Use AWS Cost Explorer to track S3 costs
 5. **Consider lifecycle policies** - Archive the index to Glacier after 30 days
 6. **Regular searches** - Keep the index file locally for quick searches
+7. **Run incrementally** - The script automatically skips already-processed emails, so you can run it regularly without duplicates
+8. **Check the summary** - Review "Already processed (skipped)" count to verify deduplication is working
 
 ## Troubleshooting
 

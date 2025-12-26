@@ -217,7 +217,69 @@ def upload_to_s3(s3_client, email_data, msg_id, attachments, s3_bucket, dry_run=
     
     return uploaded_files
 
-def add_to_index(msg_id, metadata, s3_paths, dry_run=False):
+def load_existing_index():
+    """Load existing index to check for already-processed emails
+    
+    Returns a dict mapping msg_id to their processing status:
+    {
+        'msg_id': {
+            'uploaded': bool,
+            'archived': bool,
+            'deleted': bool,
+            's3_paths': [...]
+        }
+    }
+    """
+    processed_emails = {}
+    if not os.path.exists(INDEX_FILE):
+        logger.debug("No existing index file found")
+        return processed_emails
+    
+    try:
+        with open(INDEX_FILE, 'r') as f:
+            for line_num, line in enumerate(f, 1):
+                try:
+                    entry = json.loads(line.strip())
+                    msg_id = entry.get('msg_id')
+                    if msg_id:
+                        processed_emails[msg_id] = {
+                            'uploaded': entry.get('uploaded', False),
+                            'archived': entry.get('archived', False),
+                            'deleted': entry.get('deleted', False),
+                            's3_paths': entry.get('s3_paths', []),
+                            'size_bytes': entry.get('size_bytes', 0)
+                        }
+                except json.JSONDecodeError as e:
+                    logger.warning("Skipping invalid JSON at line %d in index: %s", line_num, e)
+        logger.info("Loaded %d already-processed email IDs from index", len(processed_emails))
+    except Exception as e:
+        logger.error("Error loading index file: %s", e)
+    
+    return processed_emails
+
+def check_s3_objects_exist(s3_client, s3_bucket, s3_paths, expected_size_bytes=None):
+    """Check if S3 objects exist and optionally verify size
+    
+    Returns (all_exist, size_matches)
+    """
+    try:
+        total_size = 0
+        for path in s3_paths:
+            response = s3_client.head_object(Bucket=s3_bucket, Key=path)
+            total_size += response.get('ContentLength', 0)
+        
+        size_matches = True
+        if expected_size_bytes is not None:
+            # Allow 5% size difference for encoding overhead
+            size_diff_ratio = abs(total_size - expected_size_bytes) / max(expected_size_bytes, 1)
+            size_matches = size_diff_ratio < 0.05
+        
+        return True, size_matches
+    except Exception as e:
+        logger.debug("S3 check failed: %s", e)
+        return False, False
+
+def add_to_index(msg_id, metadata, s3_paths, uploaded=False, archived=False, deleted=False, dry_run=False):
     """Add email to search index"""
     index_entry = {
         'msg_id': msg_id,
@@ -227,9 +289,13 @@ def add_to_index(msg_id, metadata, s3_paths, dry_run=False):
         'to': metadata['to'],
         'date': metadata['date_parsed'],
         'size_mb': metadata['size_mb'],
+        'size_bytes': metadata['size_bytes'],
         'labels': metadata['labels'],
         's3_paths': s3_paths,
-        'attachment_count': len([p for p in s3_paths if 'attachments/' in p])
+        'attachment_count': len([p for p in s3_paths if 'attachments/' in p]),
+        'uploaded': uploaded,
+        'archived': archived,
+        'deleted': deleted
     }
     
     if dry_run:
@@ -349,6 +415,11 @@ def main():
         help='Maximum number of emails to process (for testing)'
     )
     parser.add_argument(
+        '--force-reprocess',
+        action='store_true',
+        help='Force reprocessing of emails already in index (not recommended)'
+    )
+    parser.add_argument(
         '--log-level',
         choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
         default='INFO',
@@ -398,6 +469,13 @@ def main():
     gmail_service = get_gmail_service()
     s3_client = boto3.client('s3') if not args.dry_run else None
     
+    # Load existing index to avoid reprocessing
+    if args.force_reprocess:
+        logger.warning("--force-reprocess enabled: will reprocess emails already in index")
+        processed_emails = {}
+    else:
+        processed_emails = load_existing_index()
+    
     # Search for large emails
     logger.info("Searching for emails larger than %d MB and older than %d year(s)...", 
                 args.size_mb, args.older_than_years)
@@ -420,11 +498,71 @@ def main():
     total_size_mb = 0
     total_attachments = 0
     skipped_count = 0
+    already_processed_count = 0
     
     for i, msg in enumerate(messages):
         try:
             msg_id = msg['id']
-            logger.info("[%d/%d] Processing: %s", i+1, len(messages), msg_id)
+            
+            # Check if already processed and determine what actions are needed
+            previous_status = processed_emails.get(msg_id)
+            
+            if previous_status:
+                # Email was processed before - check what needs to be done
+                if previous_status['deleted']:
+                    logger.info("[%d/%d] ⊘ Skipping %s - already deleted from Gmail", 
+                               i+1, len(messages), msg_id)
+                    already_processed_count += 1
+                    continue
+                
+                # Determine if we need to do anything
+                needs_upload = not previous_status['uploaded']
+                needs_archive = args.archive_gmail and not previous_status['archived']
+                needs_delete = args.delete_gmail and not previous_status['deleted']
+                
+                # If upload was done, verify S3 objects still exist
+                if previous_status['uploaded'] and not needs_upload:
+                    if not args.dry_run:
+                        s3_exists, size_matches = check_s3_objects_exist(
+                            s3_client, 
+                            args.s3_bucket, 
+                            previous_status['s3_paths'],
+                            previous_status['size_bytes']
+                        )
+                        if not s3_exists:
+                            logger.warning("[%d/%d] ⚠ %s - S3 objects missing, will re-upload", 
+                                         i+1, len(messages), msg_id)
+                            needs_upload = True
+                        elif not size_matches:
+                            logger.warning("[%d/%d] ⚠ %s - S3 size mismatch, will re-upload", 
+                                         i+1, len(messages), msg_id)
+                            needs_upload = True
+                        else:
+                            logger.debug("[%d/%d] ✓ %s - S3 objects verified", 
+                                        i+1, len(messages), msg_id)
+                
+                # If nothing needs to be done, skip
+                if not needs_upload and not needs_archive and not needs_delete:
+                    logger.info("[%d/%d] ⊘ Skipping %s - already fully processed", 
+                               i+1, len(messages), msg_id)
+                    already_processed_count += 1
+                    continue
+                
+                # Log what actions will be taken
+                actions = []
+                if needs_upload:
+                    actions.append("upload")
+                if needs_archive:
+                    actions.append("archive")
+                if needs_delete:
+                    actions.append("delete")
+                logger.info("[%d/%d] Processing %s - actions needed: %s", 
+                           i+1, len(messages), msg_id, ", ".join(actions))
+            else:
+                logger.info("[%d/%d] Processing: %s", i+1, len(messages), msg_id)
+                needs_upload = True
+                needs_archive = args.archive_gmail
+                needs_delete = args.delete_gmail
             
             # Get full email data
             email_data = get_email_data(gmail_service, msg_id)
@@ -459,30 +597,58 @@ def main():
             total_size_mb += metadata['size_mb']
             total_attachments += len(attachments)
             
-            # Upload to S3
-            s3_paths = upload_to_s3(s3_client, email_data, msg_id, attachments, args.s3_bucket, dry_run=args.dry_run)
-            if not args.dry_run:
-                logger.info("  ✓ Uploaded %d file(s) to S3", len(s3_paths))
+            # Track what was actually done (for index)
+            upload_done = False
+            archive_done = False
+            delete_done = False
+            s3_paths = []
             
-            # Add to index
-            add_to_index(msg_id, metadata, s3_paths, dry_run=args.dry_run)
+            # Upload to S3 if needed
+            if needs_upload:
+                s3_paths = upload_to_s3(s3_client, email_data, msg_id, attachments, args.s3_bucket, dry_run=args.dry_run)
+                if not args.dry_run:
+                    logger.info("  ✓ Uploaded %d file(s) to S3", len(s3_paths))
+                    upload_done = True
+                    
+                    # Verify S3 upload before any Gmail modifications
+                    upload_verified = verify_s3_upload(s3_client, args.s3_bucket, s3_paths, dry_run=args.dry_run)
+                    if not upload_verified:
+                        logger.error("  ✗ Skipping Gmail operations - S3 upload verification failed")
+                        continue
+                else:
+                    upload_done = True  # For dry-run tracking
+            else:
+                # Use previous S3 paths
+                s3_paths = previous_status.get('s3_paths', [])
+                upload_done = True
+                logger.info("  ⊘ Upload skipped - already in S3")
             
-            # Verify S3 upload before any Gmail modifications
-            if not args.dry_run:
-                upload_verified = verify_s3_upload(s3_client, args.s3_bucket, s3_paths, dry_run=args.dry_run)
-                if not upload_verified:
-                    logger.error("  ✗ Skipping Gmail operations - S3 upload verification failed")
-                    continue
-            
-            # Optional: Delete or archive the email from Gmail
-            if args.delete_gmail:
+            # Delete or archive the email from Gmail if needed
+            if needs_delete:
                 delete_email(gmail_service, msg_id, dry_run=args.dry_run)
                 if not args.dry_run:
                     logger.info("  ✓ Deleted from Gmail")
-            elif args.archive_gmail:
+                    delete_done = True
+                else:
+                    delete_done = True  # For dry-run tracking
+            elif needs_archive:
                 archive_email(gmail_service, msg_id, dry_run=args.dry_run)
                 if not args.dry_run:
                     logger.info("  ✓ Archived in Gmail")
+                    archive_done = True
+                else:
+                    archive_done = True  # For dry-run tracking
+            
+            # Add to index with status flags
+            add_to_index(
+                msg_id, 
+                metadata, 
+                s3_paths, 
+                uploaded=upload_done,
+                archived=archive_done or (previous_status and previous_status['archived']),
+                deleted=delete_done or (previous_status and previous_status['deleted']),
+                dry_run=args.dry_run
+            )
             
         except Exception as e:
             logger.error("  ✗ Error processing %s: %s", msg_id, e)
@@ -499,8 +665,9 @@ def main():
     logger.info("SUMMARY")
     logger.info("=" * 60)
     logger.info("Total emails found: %d", len(messages))
-    logger.info("Total emails archived: %d", len(messages) - skipped_count)
-    logger.info("Total emails skipped: %d", skipped_count)
+    logger.info("Already processed (skipped): %d", already_processed_count)
+    logger.info("Below attachment threshold (skipped): %d", skipped_count)
+    logger.info("Newly archived: %d", len(messages) - skipped_count - already_processed_count)
     logger.info("Total attachments: %d", total_attachments)
     logger.info("Total size: %.2f MB (%.2f GB)", total_size_mb, total_size_mb/1024)
     

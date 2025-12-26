@@ -111,11 +111,11 @@ uv run python gmail_to_s3.py --dry-run
 # Set up AWS credentials
 aws configure
 
-# Create S3 bucket
-aws s3 mb s3://your-gmail-archive-bucket
-
-# Update S3_BUCKET variable in the script
+# Create S3 bucket (replace with your desired bucket name)
+aws s3 mb s3://my-gmail-archive-bucket
 ```
+
+**Note:** You'll pass the bucket name as a command-line argument when running the script.
 
 ### 5. Add the scripts
 
@@ -128,27 +128,29 @@ Save the three artifacts:
 
 ### Archive Emails
 
+**Note:** `--s3-bucket` is required for all commands.
+
 ```bash
 # Dry run first (recommended)
-uv run python gmail_to_s3.py --dry-run
+uv run python gmail_to_s3.py --s3-bucket my-gmail-archive-bucket --dry-run
 
 # Dry run with custom filters (emails with 20MB+ in attachments, older than 2 years)
-uv run python gmail_to_s3.py --dry-run --size-mb 20 --older-than-years 2
+uv run python gmail_to_s3.py --s3-bucket my-gmail-archive-bucket --dry-run --size-mb 20 --older-than-years 2
 
 # Actually archive (default: emails with 10MB+ attachments, older than 1 year)
-uv run python gmail_to_s3.py
+uv run python gmail_to_s3.py --s3-bucket my-gmail-archive-bucket
 
 # Archive and remove from Gmail inbox
-uv run python gmail_to_s3.py --archive-gmail
+uv run python gmail_to_s3.py --s3-bucket my-gmail-archive-bucket --archive-gmail
 
 # Process only emails with very large attachments (50MB+)
-uv run python gmail_to_s3.py --size-mb 50 --older-than-years 3
+uv run python gmail_to_s3.py --s3-bucket my-gmail-archive-bucket --size-mb 50 --older-than-years 3
 
 # Test with limited number of emails
-uv run python gmail_to_s3.py --max-emails 5 --dry-run
+uv run python gmail_to_s3.py --s3-bucket my-gmail-archive-bucket --max-emails 5 --dry-run
 
 # Enable debug logging to see more details
-uv run python gmail_to_s3.py --dry-run --log-level DEBUG
+uv run python gmail_to_s3.py --s3-bucket my-gmail-archive-bucket --dry-run --log-level DEBUG
 ```
 
 **Note**: The `--size-mb` parameter filters based on the total size of attachments in each email, not the entire email size.
@@ -236,12 +238,12 @@ To retrieve an email from Glacier Deep Archive:
 ```bash
 # 1. Initiate restoration (takes 12-48 hours)
 aws s3api restore-object \
-  --bucket your-gmail-archive-bucket \
+  --bucket my-gmail-archive-bucket \
   --key emails/2023/06/abc123/email.json \
   --restore-request Days=1,GlacierJobParameters={Tier=Bulk}
 
 # 2. After restoration completes, download
-aws s3 cp s3://your-gmail-archive-bucket/emails/2023/06/abc123/email.json ./
+aws s3 cp s3://my-gmail-archive-bucket/emails/2023/06/abc123/email.json ./
 ```
 
 ## Automation
@@ -252,8 +254,8 @@ aws s3 cp s3://your-gmail-archive-bucket/emails/2023/06/abc123/email.json ./
 # Edit crontab
 crontab -e
 
-# Add line to run every Sunday at 2 AM
-0 2 * * 0 cd /path/to/gmail-s3-archiver && /home/user/.cargo/bin/uv run python gmail_to_s3.py --archive-gmail
+# Add line to run every Sunday at 2 AM (replace with your bucket name)
+0 2 * * 0 cd /path/to/gmail-s3-archiver && /home/user/.cargo/bin/uv run python gmail_to_s3.py --s3-bucket my-gmail-archive-bucket --archive-gmail
 ```
 
 ### Run on AWS Lambda (for serverless)

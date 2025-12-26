@@ -11,6 +11,7 @@ import argparse
 import logging
 from datetime import datetime
 from email.utils import parsedate_to_datetime
+import urllib.parse
 
 # Configure logging
 logging.basicConfig(
@@ -21,7 +22,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 SCOPES = ['https://www.googleapis.com/auth/gmail.modify']
-S3_BUCKET = 'iwashu-gmail-backup'
 INDEX_FILE = 'email_index.jsonl'
 
 def get_gmail_service():
@@ -151,7 +151,22 @@ def extract_attachments(service, msg_id, parts, dry_run=False):
     
     return attachments
 
-def upload_to_s3(s3_client, email_data, msg_id, attachments, dry_run=False):
+def sanitize_filename(filename):
+    """Sanitize filename for S3 and remove non-ASCII characters"""
+    # Replace problematic characters
+    sanitized = filename.replace('/', '_').replace('\\', '_').replace('..', '_')
+    # URL encode to handle non-ASCII characters
+    sanitized = urllib.parse.quote(sanitized, safe='.-_ ')
+    return sanitized
+
+def encode_metadata_value(value):
+    """Encode metadata value to ASCII-safe string using URL encoding"""
+    if not value:
+        return ''
+    # URL encode the value to make it ASCII-safe
+    return urllib.parse.quote(value, safe='')
+
+def upload_to_s3(s3_client, email_data, msg_id, attachments, s3_bucket, dry_run=False):
     """Upload email data and attachments to S3 Glacier Deep Archive"""
     timestamp = int(email_data.get('internalDate', 0)) / 1000
     date = datetime.fromtimestamp(timestamp)
@@ -162,10 +177,10 @@ def upload_to_s3(s3_client, email_data, msg_id, attachments, dry_run=False):
     # Upload main email JSON
     email_key = f"{base_path}/email.json"
     if dry_run:
-        logger.info("  [DRY RUN] Would upload to s3://%s/%s", S3_BUCKET, email_key)
+        logger.info("  [DRY RUN] Would upload to s3://%s/%s", s3_bucket, email_key)
     else:
         s3_client.put_object(
-            Bucket=S3_BUCKET,
+            Bucket=s3_bucket,
             Key=email_key,
             Body=json.dumps(email_data, indent=2),
             ContentType='application/json',
@@ -175,19 +190,25 @@ def upload_to_s3(s3_client, email_data, msg_id, attachments, dry_run=False):
     
     # Upload attachments
     for i, att in enumerate(attachments):
-        att_key = f"{base_path}/attachments/{att['filename']}"
+        # Sanitize filename for S3 key
+        safe_filename = sanitize_filename(att['filename'])
+        att_key = f"{base_path}/attachments/{safe_filename}"
         att_size_kb = att['size'] / 1024
+        
         if dry_run:
             logger.info("  [DRY RUN] Would upload attachment: %s (%.1f KB)", att['filename'], att_size_kb)
         else:
+            # Encode metadata values to ASCII
+            encoded_filename = encode_metadata_value(att['filename'])
+            
             s3_client.put_object(
-                Bucket=S3_BUCKET,
+                Bucket=s3_bucket,
                 Key=att_key,
                 Body=att['data'],
                 ContentType=att['mime_type'],
                 StorageClass='DEEP_ARCHIVE',
                 Metadata={
-                    'original-filename': att['filename'],
+                    'original-filename': encoded_filename,
                     'email-id': msg_id
                 }
             )
@@ -229,28 +250,33 @@ def archive_email(service, msg_id, dry_run=False):
         body={'removeLabelIds': ['INBOX']}
     ).execute()
 
-def upload_index_to_s3(s3_client, dry_run=False):
+def upload_index_to_s3(s3_client, s3_bucket, dry_run=False):
     """Upload the index file to S3 for backup"""
     if not os.path.exists(INDEX_FILE):
         return
     
     index_key = f"index/{INDEX_FILE}"
     if dry_run:
-        logger.info("\n[DRY RUN] Would upload index to s3://%s/%s", S3_BUCKET, index_key)
+        logger.info("\n[DRY RUN] Would upload index to s3://%s/%s", s3_bucket, index_key)
     else:
         with open(INDEX_FILE, 'rb') as f:
             s3_client.put_object(
-                Bucket=S3_BUCKET,
+                Bucket=s3_bucket,
                 Key=index_key,
                 Body=f,
                 ContentType='application/x-ndjson',
                 StorageClass='STANDARD'
             )
-        logger.info("\n✓ Uploaded index to s3://%s/%s", S3_BUCKET, index_key)
+        logger.info("\n✓ Uploaded index to s3://%s/%s", s3_bucket, index_key)
 
 def main():
     parser = argparse.ArgumentParser(
         description='Archive large Gmail emails to S3 Glacier Deep Archive with attachments'
+    )
+    parser.add_argument(
+        '--s3-bucket',
+        required=True,
+        help='S3 bucket name for storing archived emails (required)'
     )
     parser.add_argument(
         '--dry-run',
@@ -296,6 +322,8 @@ def main():
         logger.info("=" * 60)
         logger.info("RUNNING IN DRY-RUN MODE - No changes will be made")
         logger.info("=" * 60)
+    
+    logger.info("S3 Bucket: %s", args.s3_bucket)
     
     # Initialize services
     gmail_service = get_gmail_service()
@@ -363,7 +391,7 @@ def main():
             total_attachments += len(attachments)
             
             # Upload to S3
-            s3_paths = upload_to_s3(s3_client, email_data, msg_id, attachments, dry_run=args.dry_run)
+            s3_paths = upload_to_s3(s3_client, email_data, msg_id, attachments, args.s3_bucket, dry_run=args.dry_run)
             if not args.dry_run:
                 logger.info("  ✓ Uploaded %d file(s) to S3", len(s3_paths))
             
@@ -384,7 +412,7 @@ def main():
     
     # Upload index to S3
     if not args.dry_run:
-        upload_index_to_s3(s3_client, dry_run=args.dry_run)
+        upload_index_to_s3(s3_client, args.s3_bucket, dry_run=args.dry_run)
     
     # Summary
     logger.info("=" * 60)

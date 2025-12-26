@@ -21,7 +21,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 SCOPES = ['https://www.googleapis.com/auth/gmail.modify']
-S3_BUCKET = 'your-gmail-archive-bucket'
+S3_BUCKET = 'iwashu-gmail-backup'
 INDEX_FILE = 'email_index.jsonl'
 
 def get_gmail_service():

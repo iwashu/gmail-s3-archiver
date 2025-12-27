@@ -14,3 +14,6 @@ dependencies = [
     "pytest-mock>=3.12.0",
     "pytest-cov>=4.1.0",
 ]
+
+[tool.setuptools]
+py-modules = ["gmail_to_s3"]

@@ -6,9 +6,14 @@ on:
     branches:
       - '**'
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
     - uses: actions/checkout@v4
@@ -24,4 +29,4 @@ jobs:
         pip install -e .
 
     - name: Run tests
-      run: pytest tests/
+      run: pytest --no-cov tests/

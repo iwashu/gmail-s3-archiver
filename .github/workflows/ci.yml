@@ -24,4 +24,4 @@ jobs:
         pip install -e .
 
     - name: Run tests
-      run: pytest test_gmail_to_s3.py
+      run: pytest tests/

@@ -63,10 +63,10 @@ def search_index(entries, query=None, from_addr=None, to_addr=None,
     
     # Date range filter
     if date_from:
-        results = [e for e in results if e.get('date', '') >= date_from]
+        results = [e for e in results if e.get('date', '')[:10] >= date_from]
         logger.debug("After date_from filter: %d results", len(results))
     if date_to:
-        results = [e for e in results if e.get('date', '') <= date_to]
+        results = [e for e in results if e.get('date', '')[:10] <= date_to]
         logger.debug("After date_to filter: %d results", len(results))
     
     # Size filter

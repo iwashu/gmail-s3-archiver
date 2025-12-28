@@ -53,7 +53,7 @@ def search_large_emails(service, size_mb=10, older_than_years=1):
     results = service.users().messages().list(userId='me', q=query).execute()
     messages = results.get('messages', [])
     
-    while 'nextPageToken' in results:
+    while results.get('nextPageToken'):
         page_token = results['nextPageToken']
         results = service.users().messages().list(
             userId='me', q=query, pageToken=page_token).execute()
@@ -507,7 +507,7 @@ def main():
             # Check if already processed and determine what actions are needed
             previous_status = processed_emails.get(msg_id)
             
-            if previous_status:
+            if previous_status is not None:
                 # Email was processed before - check what needs to be done
                 if previous_status['deleted']:
                     logger.info("[%d/%d] ⊘ Skipping %s - already deleted from Gmail", 

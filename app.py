@@ -59,10 +59,10 @@ def search_index(entries, query=None, from_addr=None, to_addr=None,
 
     # Date range filter
     if date_from:
-        results = [e for e in results if e.get('date', '') >= date_from]
+        results = [e for e in results if e.get('date', '')[:10] >= date_from]
         logger.debug("After date_from filter: %d results", len(results))
     if date_to:
-        results = [e for e in results if e.get('date', '') <= date_to]
+        results = [e for e in results if e.get('date', '')[:10] <= date_to]
         logger.debug("After date_to filter: %d results", len(results))
 
     # Size filter
@@ -87,15 +87,19 @@ def main():
 
     # Sidebar for filters
     st.sidebar.header("Search Filters")
-    query = st.sidebar.text_input("Query", placeholder="Search in subject, from, or to")
-    from_addr = st.sidebar.text_input("From", placeholder="Filter by sender")
-    to_addr = st.sidebar.text_input("To", placeholder="Filter by recipient")
-    date_from = st.sidebar.date_input("Date From", value=None)
-    date_to = st.sidebar.date_input("Date To", value=None)
-    min_size_mb = st.sidebar.number_input("Min Size (MB)", min_value=0.0, step=0.1, value=0.0)
-    has_attachments = st.sidebar.checkbox("Has Attachments")
 
-    if st.sidebar.button("Search"):
+    with st.sidebar.form("search_form"):
+        query = st.text_input("Query", placeholder="Search in subject, from, or to")
+        from_addr = st.text_input("From", placeholder="Filter by sender")
+        to_addr = st.text_input("To", placeholder="Filter by recipient")
+        date_from = st.date_input("Date From", value=None)
+        date_to = st.date_input("Date To", value=None)
+        min_size_mb = st.number_input("Min Size (MB)", min_value=0.0, step=0.1, value=0.0)
+        has_attachments = st.checkbox("Has Attachments")
+
+        submitted = st.form_submit_button("Search")
+
+    if submitted:
         # Convert dates to string
         df_str = date_from.strftime("%Y-%m-%d") if date_from else None
         dt_str = date_to.strftime("%Y-%m-%d") if date_to else None

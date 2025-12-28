@@ -220,6 +220,8 @@ uv run python gmail_to_s3.py \
 
 ### Search Archive
 
+#### Command Line Search
+
 ```bash
 # Show archive statistics
 uv run python search_index.py --stats
@@ -239,6 +241,25 @@ uv run python search_index.py --query "report" --verbose
 # Complex search
 uv run python search_index.py --from "@company.com" --min-size 20 --has-attachments
 ```
+
+#### Streamlit Web App
+
+For a more interactive experience, use the Streamlit web interface:
+
+```bash
+# Install dependencies (if not already done)
+uv sync
+
+# Launch the app
+uv run streamlit run app.py
+```
+
+The web app provides:
+- **Interactive search filters** in the sidebar (query, sender, recipient, date range, size, attachments)
+- **Results displayed in a sortable table**
+- **Archive statistics** shown below the search interface
+
+Open your browser to the URL shown (typically http://localhost:8501) to start searching your archived emails.
 
 ## S3 Structure
 

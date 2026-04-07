@@ -29,7 +29,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 INDEX_FILE = 'email_index.jsonl'
-S3_BUCKET = load_env() or 'iwashu-gmail-backup'
+S3_BUCKET = load_env()
 
 def load_index():
     """Load all entries from the index"""
@@ -135,6 +135,10 @@ def restore_from_glacier(email_entry):
 
 def main():
     st.title("Gmail S3 Archiver Search")
+
+    if not S3_BUCKET:
+        st.error("S3_BUCKET is not set. Please add `S3_BUCKET=your-bucket-name` to your .env file.")
+        st.stop()
 
     entries = load_index()
     if not entries:

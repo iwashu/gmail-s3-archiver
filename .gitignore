@@ -1,4 +1,5 @@
 # Sensitive files - DO NOT COMMIT
+.env
 credentials.json
 token.pickle
 

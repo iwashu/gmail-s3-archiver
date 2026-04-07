@@ -43,13 +43,22 @@ def get_gmail_service():
     
     return build('gmail', 'v1', credentials=creds)
 
-def search_large_emails(service, size_mb=10, older_than_years=1):
+def search_large_emails(service, size_mb=10, older_than_years=1, date_from=None, date_to=None):
     """Search for emails larger than size_mb and older than specified years
-    
+
     Note: This searches for emails where the TOTAL email size (including attachments)
     is larger than size_mb. We'll filter further based on attachment sizes later.
+    date_from and date_to should be 'YYYY/MM/DD' strings (Gmail query format).
+    When date_from/date_to are provided, older_than_years is ignored.
     """
-    query = f'size:{size_mb}m older_than:{older_than_years}y'
+    if date_from or date_to:
+        query = f'size:{size_mb}m'
+        if date_from:
+            query += f' after:{date_from}'
+        if date_to:
+            query += f' before:{date_to}'
+    else:
+        query = f'size:{size_mb}m older_than:{older_than_years}y'
     results = service.users().messages().list(userId='me', q=query).execute()
     messages = results.get('messages', [])
     
@@ -394,6 +403,18 @@ def main():
         help='Only process emails older than N years (default: 1)'
     )
     parser.add_argument(
+        '--date-from',
+        type=str,
+        default=None,
+        help='Only process emails on or after this date (YYYY-MM-DD). Overrides --older-than-years.'
+    )
+    parser.add_argument(
+        '--date-to',
+        type=str,
+        default=None,
+        help='Only process emails on or before this date (YYYY-MM-DD). Overrides --older-than-years.'
+    )
+    parser.add_argument(
         '--archive-gmail',
         action='store_true',
         help='Archive emails in Gmail after uploading to S3 (removes from inbox but keeps in All Mail)'
@@ -477,12 +498,21 @@ def main():
         processed_emails = load_existing_index()
     
     # Search for large emails
-    logger.info("Searching for emails larger than %d MB and older than %d year(s)...", 
-                args.size_mb, args.older_than_years)
+    date_from_gmail = args.date_from.replace('-', '/') if args.date_from else None
+    date_to_gmail = args.date_to.replace('-', '/') if args.date_to else None
+
+    if date_from_gmail or date_to_gmail:
+        logger.info("Searching for emails larger than %d MB between %s and %s...",
+                    args.size_mb, args.date_from or '*', args.date_to or '*')
+    else:
+        logger.info("Searching for emails larger than %d MB and older than %d year(s)...",
+                    args.size_mb, args.older_than_years)
     messages = search_large_emails(
-        gmail_service, 
-        size_mb=args.size_mb, 
-        older_than_years=args.older_than_years
+        gmail_service,
+        size_mb=args.size_mb,
+        older_than_years=args.older_than_years,
+        date_from=date_from_gmail,
+        date_to=date_to_gmail,
     )
     
     if args.max_emails:

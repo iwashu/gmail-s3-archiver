@@ -318,12 +318,14 @@ class TestExternalAPIFunctions:
 
     @patch('gmail_to_s3.pickle.dump')
     @patch('gmail_to_s3.pickle.load')
+    @patch('gmail_to_s3.os.path.getsize')
     @patch('gmail_to_s3.os.path.exists')
     @patch('gmail_to_s3.Request')
     @patch('gmail_to_s3.build')
-    def test_get_gmail_service_refresh_token(self, mock_build, mock_request, mock_exists, mock_pickle_load, mock_pickle_dump):
+    def test_get_gmail_service_refresh_token(self, mock_build, mock_request, mock_exists, mock_getsize, mock_pickle_load, mock_pickle_dump):
         """Test getting Gmail service when credentials need refresh."""
         mock_exists.return_value = True
+        mock_getsize.return_value = 100
         mock_creds = Mock()
         mock_creds.valid = False
         mock_creds.expired = True
@@ -336,11 +338,13 @@ class TestExternalAPIFunctions:
         mock_build.assert_called_once_with('gmail', 'v1', credentials=mock_creds)
 
     @patch('gmail_to_s3.pickle.load')
+    @patch('gmail_to_s3.os.path.getsize')
     @patch('gmail_to_s3.os.path.exists')
     @patch('gmail_to_s3.build')
-    def test_get_gmail_service_valid_token(self, mock_build, mock_exists, mock_pickle_load):
+    def test_get_gmail_service_valid_token(self, mock_build, mock_exists, mock_getsize, mock_pickle_load):
         """Test getting Gmail service with valid existing token."""
         mock_exists.return_value = True
+        mock_getsize.return_value = 100
         mock_creds = Mock()
         mock_creds.valid = True
         mock_pickle_load.return_value = mock_creds

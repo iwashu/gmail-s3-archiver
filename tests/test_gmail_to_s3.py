@@ -15,6 +15,7 @@ from gmail_to_s3 import (
     add_to_index,
     get_gmail_service,
     search_large_emails,
+    build_size_query,
     get_email_data,
     extract_attachments,
     upload_to_s3,
@@ -728,3 +729,18 @@ class TestMainFunction:
 
 if __name__ == '__main__':
     pytest.main([__file__])
+
+class TestSizeQuery:
+    def test_whole_mb_keeps_m_suffix(self):
+        assert build_size_query(10) == 'size:10m'
+        assert build_size_query(10.0) == 'size:10m'
+
+    def test_kb_threshold_uses_bytes(self):
+        assert build_size_query(500 / 1024) == 'size:512000'
+
+    def test_search_with_kb_and_date_to(self):
+        mock_service = Mock()
+        mock_service.users().messages().list().execute.return_value = {'messages': []}
+        search_large_emails(mock_service, size_mb=500 / 1024, date_to='2026/01/31')
+        mock_service.users().messages().list.assert_called_with(
+            userId='me', q='size:512000 before:2026/01/31')

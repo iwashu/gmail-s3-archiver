@@ -26,9 +26,13 @@ INDEX_FILE = 'email_index.jsonl'
 
 def get_gmail_service():
     creds = None
-    if os.path.exists('token.pickle'):
+    # token.pickle is written by this script's own oauth flow, not external input
+    if os.path.exists('token.pickle') and os.path.getsize('token.pickle') > 0:
         with open('token.pickle', 'rb') as token:
-            creds = pickle.load(token)
+            try:
+                creds = pickle.load(token)
+            except (pickle.UnpicklingError, EOFError):
+                creds = None
     
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
@@ -43,6 +47,13 @@ def get_gmail_service():
     
     return build('gmail', 'v1', credentials=creds)
 
+def build_size_query(size_mb):
+    """Build the Gmail size filter. Whole MB keeps the 'size:Nm' form;
+    fractional MB (e.g. from --size-kb) is expressed in bytes ('size:N')."""
+    if float(size_mb).is_integer():
+        return f'size:{int(size_mb)}m'
+    return f'size:{int(round(size_mb * 1024 * 1024))}'
+
 def search_large_emails(service, size_mb=10, older_than_years=1, date_from=None, date_to=None):
     """Search for emails larger than size_mb and older than specified years
 
@@ -51,14 +62,14 @@ def search_large_emails(service, size_mb=10, older_than_years=1, date_from=None,
     date_from and date_to should be 'YYYY/MM/DD' strings (Gmail query format).
     When date_from/date_to are provided, older_than_years is ignored.
     """
+    query = build_size_query(size_mb)
     if date_from or date_to:
-        query = f'size:{size_mb}m'
         if date_from:
             query += f' after:{date_from}'
         if date_to:
             query += f' before:{date_to}'
     else:
-        query = f'size:{size_mb}m older_than:{older_than_years}y'
+        query += f' older_than:{older_than_years}y'
     results = service.users().messages().list(userId='me', q=query).execute()
     messages = results.get('messages', [])
     
@@ -392,9 +403,15 @@ def main():
     )
     parser.add_argument(
         '--size-mb',
-        type=int,
+        type=float,
         default=10,
         help='Minimum total email size in MB (default: 10)'
+    )
+    parser.add_argument(
+        '--size-kb',
+        type=float,
+        default=None,
+        help='Minimum total email size in KB (overrides --size-mb, e.g. 500)'
     )
     parser.add_argument(
         '--older-than-years',
@@ -412,7 +429,7 @@ def main():
         '--date-to',
         type=str,
         default=None,
-        help='Only process emails on or before this date (YYYY-MM-DD). Overrides --older-than-years.'
+        help='Only process emails before this date, exclusive (YYYY-MM-DD; Gmail before:). Overrides --older-than-years.'
     )
     parser.add_argument(
         '--archive-gmail',
@@ -448,6 +465,8 @@ def main():
     )
     
     args = parser.parse_args()
+    if isinstance(args.size_kb, (int, float)):
+        args.size_mb = args.size_kb / 1024
     
     # Safety check for deletion
     if args.delete_gmail and not args.i_understand_deletion_is_permanent:
@@ -502,10 +521,10 @@ def main():
     date_to_gmail = args.date_to.replace('-', '/') if args.date_to else None
 
     if date_from_gmail or date_to_gmail:
-        logger.info("Searching for emails larger than %d MB between %s and %s...",
+        logger.info("Searching for emails larger than %.2f MB between %s and %s...",
                     args.size_mb, args.date_from or '*', args.date_to or '*')
     else:
-        logger.info("Searching for emails larger than %d MB and older than %d year(s)...",
+        logger.info("Searching for emails larger than %.2f MB and older than %d year(s)...",
                     args.size_mb, args.older_than_years)
     messages = search_large_emails(
         gmail_service,
@@ -619,7 +638,7 @@ def main():
             
             # Check if total email size meets threshold
             if metadata['size_mb'] < args.size_mb:
-                logger.info("  ⊘ Skipping: total email size (%.2f MB) below threshold (%d MB)", 
+                logger.info("  ⊘ Skipping: total email size (%.2f MB) below threshold (%.2f MB)", 
                            metadata['size_mb'], args.size_mb)
                 skipped_count += 1
                 continue

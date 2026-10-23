@@ -359,6 +359,99 @@ def find_followup_messages_in_big_threads(service, processed_emails, size_mb):
                 followups.append({'id': msg['id']})
     return followups
 
+def list_all_message_ids(service, older_than_years=None, date_from=None, date_to=None):
+    """List every message id in the mailbox matching only the age/date filter -
+    no size filter. This is the cheap part of a full-thread-size scan: messages.list
+    returns id + threadId for free, with no per-message cost.
+    """
+    query_parts = []
+    if date_from or date_to:
+        if date_from:
+            query_parts.append(f'after:{date_from}')
+        if date_to:
+            query_parts.append(f'before:{date_to}')
+    elif older_than_years:
+        query_parts.append(f'older_than:{older_than_years}y')
+    query = ' '.join(query_parts) or None
+
+    results = service.users().messages().list(userId='me', q=query).execute()
+    ids = [m['id'] for m in results.get('messages', [])]
+    while results.get('nextPageToken'):
+        results = service.users().messages().list(
+            userId='me', q=query, pageToken=results['nextPageToken']).execute()
+        ids.extend(m['id'] for m in results.get('messages', []))
+    return ids
+
+def fetch_sizes_and_threads_batch(service, msg_ids, batch_size=100):
+    """Fetch {msg_id: (thread_id, size_bytes)} for many messages via Gmail batch
+    requests (format='minimal' - cheapest call that still returns sizeEstimate),
+    to avoid one HTTP round-trip per message when scanning the whole mailbox.
+    """
+    results = {}
+
+    def make_callback(mid):
+        def callback(request_id, response, exception):
+            if exception is not None:
+                logger.warning("Batch fetch failed for %s: %s", mid, exception)
+                return
+            results[mid] = (response.get('threadId'), response.get('sizeEstimate', 0))
+        return callback
+
+    for i in range(0, len(msg_ids), batch_size):
+        chunk = msg_ids[i:i + batch_size]
+        batch = service.new_batch_http_request()
+        for mid in chunk:
+            batch.add(
+                service.users().messages().get(userId='me', id=mid, format='minimal'),
+                callback=make_callback(mid)
+            )
+        batch.execute()
+    return results
+
+def find_oversized_threads_full_scan(service, size_mb, processed_emails,
+                                      older_than_years=None, date_from=None, date_to=None):
+    """Full-mailbox scan for threads whose CUMULATIVE size crosses the threshold,
+    including threads made entirely of individually-small messages that the
+    size: search query would never surface on its own (the gap the per-message
+    and thread-catchup logic above can't close, since both need at least one
+    big message to ever notice a thread). Expensive on a large, never-scanned
+    mailbox - this hits every message at least once, via batch requests to keep
+    the API round-trips down. Known sizes already in the index are reused, so
+    repeat runs only pay for genuinely new mail.
+    Returns the full set of message ids belonging to a qualifying thread.
+    """
+    threshold_bytes = size_mb * 1024 * 1024
+    all_ids = list_all_message_ids(service, older_than_years, date_from, date_to)
+
+    thread_sizes = {}
+    thread_members = {}
+    to_fetch = []
+
+    for mid in all_ids:
+        e = processed_emails.get(mid)
+        if e and e.get('thread_id'):
+            tid = e['thread_id']
+            thread_sizes[tid] = thread_sizes.get(tid, 0) + e.get('size_bytes', 0)
+            thread_members.setdefault(tid, set()).add(mid)
+        else:
+            to_fetch.append(mid)
+
+    if to_fetch:
+        logger.info("Full thread scan: fetching size/thread info for %d message(s) not yet in the index...",
+                     len(to_fetch))
+        fetched = fetch_sizes_and_threads_batch(service, to_fetch)
+        for mid, (tid, size) in fetched.items():
+            if not tid:
+                continue
+            thread_sizes[tid] = thread_sizes.get(tid, 0) + size
+            thread_members.setdefault(tid, set()).add(mid)
+
+    oversized_ids = set()
+    for tid, total in thread_sizes.items():
+        if total >= threshold_bytes:
+            oversized_ids |= thread_members[tid]
+    return oversized_ids
+
 def check_s3_objects_exist(s3_client, s3_bucket, s3_paths, expected_size_bytes=None):
     """Check if S3 objects exist and optionally verify size
     
@@ -518,6 +611,14 @@ def main():
         help='Only process emails before this date, exclusive (YYYY-MM-DD; Gmail before:). Overrides --older-than-years.'
     )
     parser.add_argument(
+        '--full-thread-scan',
+        action='store_true',
+        help='Scan every message in the mailbox (not just ones matching the size filter) to find '
+             'threads whose CUMULATIVE size crosses the threshold even when no single message in '
+             'them does. Expensive on a large, never-scanned mailbox (one API call per not-yet-indexed '
+             'message, batched); cheap on repeat runs since known sizes are reused from the index.'
+    )
+    parser.add_argument(
         '--archive-gmail',
         action='store_true',
         help='Archive emails in Gmail after uploading to S3 (removes from inbox but keeps in All Mail)'
@@ -635,6 +736,27 @@ def main():
             followup_ids.add(msg['id'])
     if followup_ids:
         logger.info("Found %d additional follow-up message(s) in already-oversized threads", len(followup_ids))
+
+    # Full-mailbox scan (opt-in): catches threads that are over threshold only in
+    # aggregate, where no single message ever matched the size: query above.
+    if args.full_thread_scan:
+        logger.info("Running full-thread-scan across the mailbox (this may take a while)...")
+        scan_ids = find_oversized_threads_full_scan(
+            gmail_service, args.size_mb, processed_emails,
+            older_than_years=args.older_than_years if not (date_from_gmail or date_to_gmail) else None,
+            date_from=date_from_gmail,
+            date_to=date_to_gmail,
+        )
+        new_from_scan = 0
+        for mid in scan_ids:
+            if mid not in seen_ids:
+                messages.append({'id': mid})
+                seen_ids.add(mid)
+                followup_ids.add(mid)
+                new_from_scan += 1
+        if new_from_scan:
+            logger.info("Full thread scan found %d additional message(s) in aggregate-oversized threads",
+                        new_from_scan)
 
     logger.info("Found %d emails to archive", len(messages))
     

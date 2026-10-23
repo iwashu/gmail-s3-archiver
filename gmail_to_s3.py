@@ -55,6 +55,13 @@ def build_size_query(size_mb):
         return f'size:{int(size_mb)}m'
     return f'size:{int(round(size_mb * 1024 * 1024))}'
 
+# Scoped to the inbox's Primary tab only - Gmail already excludes Spam/Trash from
+# search by default (would need in:anywhere to include them), so that needs no flag.
+INBOX_PRIMARY_SCOPE = (
+    'in:inbox -category:social -category:promotions -category:updates '
+    '-category:forums -category:purchases -category:reservations'
+)
+
 def search_large_emails(service, size_mb=10, older_than_years=1, date_from=None, date_to=None):
     """Search for emails larger than size_mb and older than specified years
 
@@ -62,8 +69,9 @@ def search_large_emails(service, size_mb=10, older_than_years=1, date_from=None,
     is larger than size_mb. We'll filter further based on attachment sizes later.
     date_from and date_to should be 'YYYY/MM/DD' strings (Gmail query format).
     When date_from/date_to are provided, older_than_years is ignored.
+    Scoped to the inbox Primary tab - see INBOX_PRIMARY_SCOPE.
     """
-    query = build_size_query(size_mb)
+    query = f'{build_size_query(size_mb)} {INBOX_PRIMARY_SCOPE}'
     if date_from or date_to:
         if date_from:
             query += f' after:{date_from}'
@@ -363,8 +371,9 @@ def list_all_message_ids(service, older_than_years=None, date_from=None, date_to
     """List every message id in the mailbox matching only the age/date filter -
     no size filter. This is the cheap part of a full-thread-size scan: messages.list
     returns id + threadId for free, with no per-message cost.
+    Scoped to the inbox Primary tab - see INBOX_PRIMARY_SCOPE.
     """
-    query_parts = []
+    query_parts = [INBOX_PRIMARY_SCOPE]
     if date_from or date_to:
         if date_from:
             query_parts.append(f'after:{date_from}')
@@ -372,7 +381,7 @@ def list_all_message_ids(service, older_than_years=None, date_from=None, date_to
             query_parts.append(f'before:{date_to}')
     elif older_than_years:
         query_parts.append(f'older_than:{older_than_years}y')
-    query = ' '.join(query_parts) or None
+    query = ' '.join(query_parts)
 
     results = service.users().messages().list(userId='me', q=query).execute()
     ids = [m['id'] for m in results.get('messages', [])]

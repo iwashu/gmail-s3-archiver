@@ -26,7 +26,8 @@ from gmail_to_s3 import (
     upload_index_to_s3,
     main,
     INDEX_FILE,
-    SCOPES
+    SCOPES,
+    INBOX_PRIMARY_SCOPE
 )
 
 
@@ -370,7 +371,7 @@ class TestExternalAPIFunctions:
         assert messages == [{'id': 'msg1'}, {'id': 'msg2'}]
         mock_service.users().messages().list.assert_called_with(
             userId='me',
-            q='size:10m older_than:1y'
+            q=f'size:10m {INBOX_PRIMARY_SCOPE} older_than:1y'
         )
 
     def test_search_large_emails_with_pagination(self):
@@ -748,4 +749,4 @@ class TestSizeQuery:
         mock_service.users().messages().list().execute.return_value = {'messages': []}
         search_large_emails(mock_service, size_mb=500 / 1024, date_to='2026/01/31')
         mock_service.users().messages().list.assert_called_with(
-            userId='me', q='size:512000 before:2026/01/31')
+            userId='me', q=f'size:512000 {INBOX_PRIMARY_SCOPE} before:2026/01/31')

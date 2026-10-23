@@ -4,6 +4,7 @@ from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 import boto3
 import base64
+import gzip
 import os
 import pickle
 import json
@@ -130,7 +131,8 @@ def parse_email_metadata(email_data):
         'date_parsed': date_obj.isoformat() if date_obj else date.isoformat(),
         'labels': email_data.get('labelIds', []),
         'size_bytes': email_data.get('sizeEstimate', 0),
-        'size_mb': get_email_size(email_data)
+        'size_mb': get_email_size(email_data),
+        'thread_id': email_data.get('threadId')
     }
 
 def extract_attachments(service, msg_id, parts, dry_run=False):
@@ -186,45 +188,68 @@ def encode_metadata_value(value):
     # URL encode the value to make it ASCII-safe
     return urllib.parse.quote(value, safe='')
 
+def compress_bytes(data):
+    """Gzip-compress bytes for upload.
+
+    Skips compression when it doesn't actually shrink the payload (common for
+    already-compressed formats like JPEG/PNG/ZIP/PDF), since paying gzip's CPU
+    cost for a larger or equal-size result has no benefit.
+    Returns (payload, is_compressed).
+    """
+    compressed = gzip.compress(data, compresslevel=9)
+    if len(compressed) < len(data):
+        return compressed, True
+    return data, False
+
 def upload_to_s3(s3_client, email_data, msg_id, attachments, s3_bucket, dry_run=False):
-    """Upload email data and attachments to S3 Glacier Deep Archive"""
+    """Upload email data and attachments to S3 Glacier Deep Archive, gzip-compressed where it helps"""
     timestamp = int(email_data.get('internalDate', 0)) / 1000
     date = datetime.fromtimestamp(timestamp)
     base_path = f"emails/{date.year}/{date.month:02d}/{msg_id}"
-    
+
     uploaded_files = []
-    
-    # Upload main email JSON
-    email_key = f"{base_path}/email.json"
+    uploaded_bytes = 0
+
+    # Upload main email JSON (text, so gzip reliably shrinks it)
     if dry_run:
-        logger.info("  [DRY RUN] Would upload to s3://%s/%s", s3_bucket, email_key)
+        email_key = f"{base_path}/email.json"
+        logger.info("  [DRY RUN] Would upload to s3://%s/%s (gzip)", s3_bucket, email_key)
     else:
-        s3_client.put_object(
+        email_body, email_compressed = compress_bytes(
+            json.dumps(email_data, indent=2).encode('utf-8'))
+        email_key = f"{base_path}/email.json" + ('.gz' if email_compressed else '')
+        put_kwargs = dict(
             Bucket=s3_bucket,
             Key=email_key,
-            Body=json.dumps(email_data, indent=2),
+            Body=email_body,
             ContentType='application/json',
             StorageClass='DEEP_ARCHIVE'
         )
+        if email_compressed:
+            put_kwargs['ContentEncoding'] = 'gzip'
+        s3_client.put_object(**put_kwargs)
+        uploaded_bytes += len(email_body)
     uploaded_files.append(email_key)
-    
+
     # Upload attachments
     for i, att in enumerate(attachments):
         # Sanitize filename for S3 key
         safe_filename = sanitize_filename(att['filename'])
-        att_key = f"{base_path}/attachments/{safe_filename}"
         att_size_kb = att['size'] / 1024
-        
+
         if dry_run:
+            att_key = f"{base_path}/attachments/{safe_filename}"
             logger.info("  [DRY RUN] Would upload attachment: %s (%.1f KB)", att['filename'], att_size_kb)
         else:
+            att_body, att_compressed = compress_bytes(att['data'])
+            att_key = f"{base_path}/attachments/{safe_filename}" + ('.gz' if att_compressed else '')
             # Encode metadata values to ASCII
             encoded_filename = encode_metadata_value(att['filename'])
-            
-            s3_client.put_object(
+
+            put_kwargs = dict(
                 Bucket=s3_bucket,
                 Key=att_key,
-                Body=att['data'],
+                Body=att_body,
                 ContentType=att['mime_type'],
                 StorageClass='DEEP_ARCHIVE',
                 Metadata={
@@ -232,10 +257,19 @@ def upload_to_s3(s3_client, email_data, msg_id, attachments, s3_bucket, dry_run=
                     'email-id': msg_id
                 }
             )
-            logger.info("  ✓ Uploaded attachment: %s (%.1f KB)", att['filename'], att_size_kb)
+            if att_compressed:
+                put_kwargs['ContentEncoding'] = 'gzip'
+            s3_client.put_object(**put_kwargs)
+            uploaded_bytes += len(att_body)
+            saved_pct = (1 - len(att_body) / att['size']) * 100 if att_compressed and att['size'] else 0
+            logger.info(
+                "  ✓ Uploaded attachment: %s (%.1f KB%s)",
+                att['filename'], att_size_kb,
+                f", gzip saved {saved_pct:.0f}%" if att_compressed else ", stored uncompressed, already compressed format"
+            )
         uploaded_files.append(att_key)
-    
-    return uploaded_files
+
+    return uploaded_files, uploaded_bytes
 
 def load_existing_index():
     """Load existing index to check for already-processed emails
@@ -262,20 +296,68 @@ def load_existing_index():
                     entry = json.loads(line.strip())
                     msg_id = entry.get('msg_id')
                     if msg_id:
+                        # uploaded_bytes = actual bytes written to S3 (post gzip);
+                        # falls back to size_bytes for entries written before compression existed
                         processed_emails[msg_id] = {
                             'uploaded': entry.get('uploaded', False),
                             'archived': entry.get('archived', False),
                             'deleted': entry.get('deleted', False),
                             's3_paths': entry.get('s3_paths', []),
-                            'size_bytes': entry.get('size_bytes', 0)
+                            'size_bytes': entry.get('size_bytes', 0),
+                            'uploaded_bytes': entry.get('uploaded_bytes', entry.get('size_bytes', 0)),
+                            'thread_id': entry.get('thread_id')
                         }
                 except json.JSONDecodeError as e:
                     logger.warning("Skipping invalid JSON at line %d in index: %s", line_num, e)
         logger.info("Loaded %d already-processed email IDs from index", len(processed_emails))
     except Exception as e:
         logger.error("Error loading index file: %s", e)
-    
+
     return processed_emails
+
+def build_thread_totals(processed_emails):
+    """Sum known message sizes per thread_id from the index.
+
+    Counts every message we've ever recorded for a thread, uploaded or not,
+    deleted or not - this tracks the thread's cumulative size over time, not
+    just what's currently sitting in Gmail. Entries written before thread_id
+    tracking existed have no thread_id and are skipped (can't attribute them).
+    Returns {thread_id: total_size_bytes}.
+    """
+    totals = {}
+    for status in processed_emails.values():
+        thread_id = status.get('thread_id')
+        if thread_id:
+            totals[thread_id] = totals.get(thread_id, 0) + status.get('size_bytes', 0)
+    return totals
+
+def find_followup_messages_in_big_threads(service, processed_emails, size_mb):
+    """Find new messages in threads whose cumulative known size already exceeds
+    the threshold, even though no single message in the thread may be that big.
+
+    Once a thread crosses the threshold, every future message in it (however
+    small) should keep getting swept up - otherwise a thread we're actively
+    archiving keeps accumulating fresh small replies in Gmail forever. This
+    scans only threads already known to be over threshold (from the index),
+    not the whole mailbox, so it stays cheap.
+    Returns a list of message dicts ({'id': ...}) not yet in the index.
+    """
+    threshold_bytes = size_mb * 1024 * 1024
+    thread_totals = build_thread_totals(processed_emails)
+    oversized_thread_ids = [tid for tid, total in thread_totals.items() if total >= threshold_bytes]
+
+    followups = []
+    for thread_id in oversized_thread_ids:
+        try:
+            thread = service.users().threads().get(
+                userId='me', id=thread_id, format='minimal').execute()
+        except Exception as e:
+            logger.warning("Could not fetch thread %s for follow-up check: %s", thread_id, e)
+            continue
+        for msg in thread.get('messages', []):
+            if msg['id'] not in processed_emails:
+                followups.append({'id': msg['id']})
+    return followups
 
 def check_s3_objects_exist(s3_client, s3_bucket, s3_paths, expected_size_bytes=None):
     """Check if S3 objects exist and optionally verify size
@@ -299,7 +381,8 @@ def check_s3_objects_exist(s3_client, s3_bucket, s3_paths, expected_size_bytes=N
         logger.debug("S3 check failed: %s", e)
         return False, False
 
-def add_to_index(msg_id, metadata, s3_paths, uploaded=False, archived=False, deleted=False, dry_run=False):
+def add_to_index(msg_id, metadata, s3_paths, uploaded=False, archived=False, deleted=False,
+                  dry_run=False, uploaded_bytes=None):
     """Add email to search index"""
     index_entry = {
         'msg_id': msg_id,
@@ -310,7 +393,10 @@ def add_to_index(msg_id, metadata, s3_paths, uploaded=False, archived=False, del
         'date': metadata['date_parsed'],
         'size_mb': metadata['size_mb'],
         'size_bytes': metadata['size_bytes'],
+        # actual bytes written to S3 (post gzip); used for S3 size verification on later runs
+        'uploaded_bytes': uploaded_bytes if uploaded_bytes is not None else metadata['size_bytes'],
         'labels': metadata['labels'],
+        'thread_id': metadata.get('thread_id'),
         's3_paths': s3_paths,
         'attachment_count': len([p for p in s3_paths if 'attachments/' in p]),
         'uploaded': uploaded,
@@ -536,7 +622,20 @@ def main():
     
     if args.max_emails:
         messages = messages[:args.max_emails]
-    
+
+    # Catch-up pass: threads already over threshold (per the index) keep sweeping up
+    # their new replies even when a given reply is individually tiny.
+    followup_messages = find_followup_messages_in_big_threads(gmail_service, processed_emails, args.size_mb)
+    seen_ids = {msg['id'] for msg in messages}
+    followup_ids = set()
+    for msg in followup_messages:
+        if msg['id'] not in seen_ids:
+            messages.append(msg)
+            seen_ids.add(msg['id'])
+            followup_ids.add(msg['id'])
+    if followup_ids:
+        logger.info("Found %d additional follow-up message(s) in already-oversized threads", len(followup_ids))
+
     logger.info("Found %d emails to archive", len(messages))
     
     if len(messages) == 0:
@@ -573,10 +672,10 @@ def main():
                 if previous_status['uploaded'] and not needs_upload:
                     if not args.dry_run:
                         s3_exists, size_matches = check_s3_objects_exist(
-                            s3_client, 
-                            args.s3_bucket, 
+                            s3_client,
+                            args.s3_bucket,
                             previous_status['s3_paths'],
-                            previous_status['size_bytes']
+                            previous_status['uploaded_bytes']
                         )
                         if not s3_exists:
                             logger.warning("[%d/%d] ⚠ %s - S3 objects missing, will re-upload", 
@@ -636,12 +735,15 @@ def main():
             attachments_size_mb = calculate_attachments_size(attachments)
             logger.info("  Attachments: %d (total size: %.2f MB)", len(attachments), attachments_size_mb)
             
-            # Check if total email size meets threshold
-            if metadata['size_mb'] < args.size_mb:
-                logger.info("  ⊘ Skipping: total email size (%.2f MB) below threshold (%.2f MB)", 
+            # Check if total email size meets threshold - unless this message only
+            # qualifies because its thread (cumulatively) is already over threshold
+            if metadata['size_mb'] < args.size_mb and msg_id not in followup_ids:
+                logger.info("  ⊘ Skipping: total email size (%.2f MB) below threshold (%.2f MB)",
                            metadata['size_mb'], args.size_mb)
                 skipped_count += 1
                 continue
+            elif msg_id in followup_ids:
+                logger.info("  ℹ Thread already over threshold - processing despite small message size")
             
             total_size_mb += metadata['size_mb']
             total_attachments += len(attachments)
@@ -651,14 +753,15 @@ def main():
             archive_done = False
             delete_done = False
             s3_paths = []
-            
+            uploaded_bytes = None
+
             # Upload to S3 if needed
             if needs_upload:
-                s3_paths = upload_to_s3(s3_client, email_data, msg_id, attachments, args.s3_bucket, dry_run=args.dry_run)
+                s3_paths, uploaded_bytes = upload_to_s3(s3_client, email_data, msg_id, attachments, args.s3_bucket, dry_run=args.dry_run)
                 if not args.dry_run:
                     logger.info("  ✓ Uploaded %d file(s) to S3", len(s3_paths))
                     upload_done = True
-                    
+
                     # Verify S3 upload before any Gmail modifications
                     upload_verified = verify_s3_upload(s3_client, args.s3_bucket, s3_paths, dry_run=args.dry_run)
                     if not upload_verified:
@@ -669,6 +772,7 @@ def main():
             else:
                 # Use previous S3 paths
                 s3_paths = previous_status.get('s3_paths', [])
+                uploaded_bytes = previous_status.get('uploaded_bytes')
                 upload_done = True
                 logger.info("  ⊘ Upload skipped - already in S3")
             
@@ -690,13 +794,14 @@ def main():
             
             # Add to index with status flags
             add_to_index(
-                msg_id, 
-                metadata, 
-                s3_paths, 
+                msg_id,
+                metadata,
+                s3_paths,
                 uploaded=upload_done,
                 archived=archive_done or (previous_status and previous_status['archived']),
                 deleted=delete_done or (previous_status and previous_status['deleted']),
-                dry_run=args.dry_run
+                dry_run=args.dry_run,
+                uploaded_bytes=uploaded_bytes
             )
             
         except Exception as e:

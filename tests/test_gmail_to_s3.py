@@ -488,9 +488,9 @@ class TestExternalAPIFunctions:
         ]
 
         with patch('gmail_to_s3.logger') as mock_logger:
-            result = upload_to_s3(mock_s3_client, email_data, 'msg1', attachments, 'test-bucket', dry_run=True)
+            s3_paths, uploaded_bytes = upload_to_s3(mock_s3_client, email_data, 'msg1', attachments, 'test-bucket', dry_run=True)
 
-            assert len(result) == 2  # email.json + attachment
+            assert len(s3_paths) == 2  # email.json + attachment
             mock_logger.info.assert_called()
             # Should not call S3 put_object in dry run
             mock_s3_client.put_object.assert_not_called()
@@ -509,9 +509,10 @@ class TestExternalAPIFunctions:
         with patch('gmail_to_s3.sanitize_filename', return_value='test.pdf'):
             with patch('gmail_to_s3.encode_metadata_value', return_value='test.pdf'):
                 with patch('gmail_to_s3.logger') as mock_logger:
-                    result = upload_to_s3(mock_s3_client, email_data, 'msg1', attachments, 'test-bucket', dry_run=False)
+                    s3_paths, uploaded_bytes = upload_to_s3(mock_s3_client, email_data, 'msg1', attachments, 'test-bucket', dry_run=False)
 
-                    assert len(result) == 2
+                    assert len(s3_paths) == 2
+                    assert uploaded_bytes > 0
                     assert mock_s3_client.put_object.call_count == 2  # email + attachment
 
     def test_archive_email_dry_run(self):
@@ -689,7 +690,7 @@ class TestMainFunction:
         }
         mock_extract.return_value = []
         mock_calc_size.return_value = 0.0
-        mock_upload_s3.return_value = ['path1']
+        mock_upload_s3.return_value = (['path1'], 1000)
         mock_verify.return_value = True
         mock_load_index.return_value = {}
 
